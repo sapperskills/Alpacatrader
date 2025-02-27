@@ -1215,7 +1215,7 @@ async def pattern_training_loop():
             await asyncio.sleep(120)
 
 ###############################################################################
-# 18) Main Function: Initialize History, Filter Symbols, Start Websocket Stream, and Loops
+# 18) Main Function: Initialize History, Filter Symbols, and Start Websocket Stream
 ###############################################################################
 global_symbols: List[str] = []
 
@@ -1227,15 +1227,32 @@ async def main():
     global trader_instance, rl_instance, trade_state_instance, global_symbols
     trader_instance = AlpacaTrader(config, logger)
     all_symbols = get_all_tradable_symbols(trader_instance, logger)
-    global_symbols = []
+    
+    # Gather candidate symbols with sufficient historical data
+    candidate_symbols = []
+    performance_metrics = {}
     for sym in all_symbols:
         df_hist = await fetch_initial_bars(sym, trader_instance, logger, days=90, timeframe="15Min")
         if not df_hist.empty and len(df_hist) >= 10:
             live_bars[sym] = df_hist.to_dict(orient="records")
-            global_symbols.append(sym)
+            candidate_symbols.append(sym)
+            try:
+                # Compute a simple performance metric: cumulative return over the period
+                first_open = df_hist.iloc[0]['open']
+                last_close = df_hist.iloc[-1]['close']
+                performance = (last_close - first_open) / first_open
+                performance_metrics[sym] = performance
+            except Exception as e:
+                logger.error(f"Error computing performance for {sym}: {e}", exc_info=True)
         else:
             logger.warning(f"{sym} => Skipped due to insufficient historical bars.")
-    logger.info(f"Filtered symbols count: {len(global_symbols)}")
+    
+    logger.info(f"Candidate symbols count: {len(candidate_symbols)}")
+    # Select the top 50 symbols based on the performance metric (highest cumulative return)
+    top_50 = sorted(candidate_symbols, key=lambda s: performance_metrics.get(s, -float('inf')), reverse=True)[:50]
+    global_symbols = top_50
+    logger.info(f"Selected top {len(global_symbols)} symbols for trading: {global_symbols}")
+    
     rl_instance = RLTrader(device, logger)
     trade_state_instance = TradeState()
     stream = Stream(API_KEY, API_SECRET, base_url=BASE_URL, data_feed="iex")
