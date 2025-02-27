@@ -35,12 +35,10 @@ if not os.path.exists(CACHE_DIR):
     os.makedirs(CACHE_DIR)
 
 def get_cache_filepath(symbol: str, timeframe: str, days: int) -> str:
-    """Returns a unique filepath for caching a symbol's historical bars."""
     filename = f"{symbol}_{timeframe}_{days}d.pkl"
     return os.path.join(CACHE_DIR, filename)
 
 def load_cached_bars(symbol: str, timeframe: str, days: int) -> Optional[pd.DataFrame]:
-    """Load cached bars if they exist."""
     filepath = get_cache_filepath(symbol, timeframe, days)
     if os.path.exists(filepath):
         try:
@@ -51,7 +49,6 @@ def load_cached_bars(symbol: str, timeframe: str, days: int) -> Optional[pd.Data
     return None
 
 def save_cached_bars(symbol: str, timeframe: str, days: int, df: pd.DataFrame):
-    """Save bars DataFrame to cache."""
     filepath = get_cache_filepath(symbol, timeframe, days)
     try:
         df.to_pickle(filepath)
@@ -249,7 +246,6 @@ def get_all_tradable_symbols(trader: AlpacaTrader, logger: logging.Logger) -> Li
 
 async def fetch_initial_bars(symbol: str, trader: AlpacaTrader, logger: logging.Logger,
                                days: int = 5, timeframe: str = "15Min", use_cache: bool = True) -> pd.DataFrame:
-    # Try loading from cache if enabled.
     if use_cache:
         cached_df = load_cached_bars(symbol, timeframe, days)
         if cached_df is not None and not cached_df.empty:
@@ -1002,6 +998,9 @@ def get_news_sentiment(symbol: str) -> float:
         return 0.0
 
 async def on_bar_callback(bar):
+    if not is_market_hours():
+        logger.info("Market is closed. Skipping bar processing.")
+        return
     timestamp = getattr(bar, "timestamp", bar._raw.get("timestamp"))
     open_price = getattr(bar, "open", bar._raw.get("open"))
     high_price = getattr(bar, "high", bar._raw.get("high"))
@@ -1130,6 +1129,7 @@ async def process_symbol(symbol: str, rl: RLTrader, trader: AlpacaTrader, logger
     rl.store_transition(state, action, reward, next_state, done, symbol_id, hist_tensor, next_history)
     rl.update_risk_mgr(trade_success=(reward > 0))
 
+# NEW: Modified apply_action now saves the RL agent's state after a trade is executed.
 async def apply_action(symbol: str, action: int, trader: AlpacaTrader, logger: logging.Logger,
                        trade_state: TradeState, rl: RLTrader, atr_value: float, shares: int):
     acct = await trader.get_account()
@@ -1162,6 +1162,7 @@ async def apply_action(symbol: str, action: int, trader: AlpacaTrader, logger: l
                 trade_details = {"timestamp": datetime.now(timezone.utc).isoformat(), "symbol": symbol, "action": "Buy", "qty": shares, "price": last_price}
                 record_trade(trade_details, logger)
                 trade_state.update_trade(symbol, last_price, 'long')
+                rl.save_agent()  # Save state immediately after trade action
     elif action == 2:
         if current_qty < 0:
             logger.info(f"{symbol} => Already short. Skipping entry.")
@@ -1176,6 +1177,7 @@ async def apply_action(symbol: str, action: int, trader: AlpacaTrader, logger: l
                 trade_details = {"timestamp": datetime.now(timezone.utc).isoformat(), "symbol": symbol, "action": "Short", "qty": shares, "price": last_price}
                 record_trade(trade_details, logger)
                 trade_state.update_trade(symbol, last_price, 'short')
+                rl.save_agent()  # Save state immediately after trade action
 
 ###############################################################################
 # 17) RL and Proprietary Predictor Optimization Loops
@@ -1215,7 +1217,7 @@ async def pattern_training_loop():
             await asyncio.sleep(120)
 
 ###############################################################################
-# 18) Main Function: Initialize History, Filter Symbols, and Start Websocket Stream
+# 18) Main Function: Initialize History, Filter Symbols, Start Websocket Stream, and Loops
 ###############################################################################
 global_symbols: List[str] = []
 
@@ -1226,9 +1228,14 @@ trade_state_instance: Optional[TradeState] = None
 async def main():
     global trader_instance, rl_instance, trade_state_instance, global_symbols
     trader_instance = AlpacaTrader(config, logger)
+    
+    if not is_market_hours():
+        seconds_to_wait = time_until_market_open()
+        logger.info(f"Market is closed. Waiting for {seconds_to_wait:.0f} seconds until market open.")
+        await asyncio.sleep(seconds_to_wait)
+    
     all_symbols = get_all_tradable_symbols(trader_instance, logger)
     
-    # Gather candidate symbols with sufficient historical data
     candidate_symbols = []
     performance_metrics = {}
     for sym in all_symbols:
@@ -1237,7 +1244,6 @@ async def main():
             live_bars[sym] = df_hist.to_dict(orient="records")
             candidate_symbols.append(sym)
             try:
-                # Compute a simple performance metric: cumulative return over the period
                 first_open = df_hist.iloc[0]['open']
                 last_close = df_hist.iloc[-1]['close']
                 performance = (last_close - first_open) / first_open
@@ -1248,9 +1254,8 @@ async def main():
             logger.warning(f"{sym} => Skipped due to insufficient historical bars.")
     
     logger.info(f"Candidate symbols count: {len(candidate_symbols)}")
-    # Select the top 50 symbols based on the performance metric (highest cumulative return)
-    top_50 = sorted(candidate_symbols, key=lambda s: performance_metrics.get(s, -float('inf')), reverse=True)[:50]
-    global_symbols = top_50
+    top_150 = sorted(candidate_symbols, key=lambda s: performance_metrics.get(s, -float('inf')), reverse=True)[:150]
+    global_symbols = top_150
     logger.info(f"Selected top {len(global_symbols)} symbols for trading: {global_symbols}")
     
     rl_instance = RLTrader(device, logger)
