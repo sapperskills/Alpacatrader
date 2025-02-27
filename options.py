@@ -1,27 +1,10 @@
 #!/usr/bin/env python
-"""
-Production-Ready Options Trading Bot with Dynamic Options Screening & Advanced Risk Management
-
-This bot uses Alpaca’s options contracts endpoint (via a dedicated REST client with api_version="v2")
-to dynamically retrieve options chain data, select top underlyings based on liquidity and Greeks,
-and then uses a transformer-based deep Q-network (RL agent) to decide whether to trade a call or put option.
-Option orders are submitted using the option symbol provided by our scanning function.
-A dedicated websocket subscriber receives real-time option data (msgpack).
-The bot also uses technical indicators, risk management, and additional predictors for enhanced decision making.
-
-Before deploying:
-  • Update config.json with your Alpaca API credentials.
-  • Ensure your account is enabled for options trading.
-  • Test in paper mode.
-"""
-
 import os, json, math, random, logging, asyncio, pickle
 import numpy as np, pandas as pd
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, List, Tuple
 from logging.handlers import RotatingFileHandler
-from collections import namedtuple
-from urllib.parse import urlencode
+from collections import deque, namedtuple
 
 import nest_asyncio
 nest_asyncio.apply()
@@ -31,21 +14,18 @@ import alpaca_trade_api as tradeapi
 from alpaca_trade_api.rest import REST, APIError
 from alpaca_trade_api.stream import Stream
 
-# PyTorch for RL
+# PyTorch for RL and pattern prediction
 import torch, torch.nn as nn, torch.optim as optim, torch.nn.functional as F
 
 # TA-Lib indicators
 import ta
 from ta.volatility import BollingerBands, AverageTrueRange, KeltnerChannel
-from ta.trend import MACD, ADXIndicator
+from ta.trend import MACD, SMAIndicator, ADXIndicator
 from ta.momentum import RSIIndicator
 
-# HuggingFace Transformers – explicit model details for production
+# HuggingFace Transformers for sentiment analysis (force PyTorch)
 from transformers import pipeline
-sentiment_analyzer = pipeline("sentiment-analysis", 
-                              model="distilbert-base-uncased-finetuned-sst-2-english", 
-                              revision="main", 
-                              framework="pt")
+sentiment_analyzer = pipeline("sentiment-analysis", framework="pt")
 
 ###############################################################################
 # Cache System for Historical Bars
@@ -55,19 +35,23 @@ if not os.path.exists(CACHE_DIR):
     os.makedirs(CACHE_DIR)
 
 def get_cache_filepath(symbol: str, timeframe: str, days: int) -> str:
+    """Returns a unique filepath for caching a symbol's historical bars."""
     filename = f"{symbol}_{timeframe}_{days}d.pkl"
     return os.path.join(CACHE_DIR, filename)
 
 def load_cached_bars(symbol: str, timeframe: str, days: int) -> Optional[pd.DataFrame]:
+    """Load cached bars if they exist."""
     filepath = get_cache_filepath(symbol, timeframe, days)
     if os.path.exists(filepath):
         try:
-            return pd.read_pickle(filepath)
+            df = pd.read_pickle(filepath)
+            return df
         except Exception as e:
             logger.error(f"Failed to load cache for {symbol}: {e}", exc_info=True)
     return None
 
 def save_cached_bars(symbol: str, timeframe: str, days: int, df: pd.DataFrame):
+    """Save bars DataFrame to cache."""
     filepath = get_cache_filepath(symbol, timeframe, days)
     try:
         df.to_pickle(filepath)
@@ -93,11 +77,12 @@ def time_until_market_open() -> float:
     now_et = datetime.now(ZoneInfo("America/New_York"))
     market_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
     if now_et < market_open:
-        return (market_open - now_et).total_seconds()
+        delta = market_open - now_et
     else:
         next_day = now_et + timedelta(days=1)
         market_open_next = next_day.replace(hour=9, minute=30, second=0, microsecond=0)
-        return (market_open_next - now_et).total_seconds()
+        delta = market_open_next - now_et
+    return delta.total_seconds()
 
 ###############################################################################
 # 1) Load Config and Setup Logging
@@ -115,11 +100,12 @@ API_KEY = config.get("API_KEY")
 API_SECRET = config.get("API_SECRET")
 PAPER = config.get("PAPER", True)
 BASE_URL = config.get("BASE_URL", "https://paper-api.alpaca.markets")
-TRADE_OPTIONS = config.get("trade_options", True)
+TRADE_OPTIONS = config.get("trade_options", False)
 
 LOG_FILE = config.get("LOG_FILE", "trading_bot.log")
 LOG_LEVEL_STR = config.get("LOG_LEVEL", "INFO").upper()
 
+# RL and risk hyperparameters
 MEMORY_SIZE = config.get("MEMORY_SIZE", 100000)
 BATCH_SIZE = config.get("BATCH_SIZE", 64)
 GAMMA = config.get("GAMMA", 0.99)
@@ -138,6 +124,7 @@ TAKE_PROFIT = config.get("TAKE_PROFIT", 0.03)
 MIN_HOLD_DAYS = config.get("MIN_HOLD_DAYS", 1)
 MAX_HOLD_DAYS = config.get("MAX_HOLD_DAYS", 10)
 
+# Transformer config for RL agent
 TRANSFORMER_LAYERS = config.get("TRANSFORMER_LAYERS", 3)
 ATTENTION_HEADS = config.get("ATTENTION_HEADS", 4)
 
@@ -156,15 +143,10 @@ stream_handler.setFormatter(stream_formatter)
 logger.addHandler(stream_handler)
 
 ###############################################################################
-# Set device
+# Set device and log it
 ###############################################################################
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 logger.info(f"Device set to use {device}")
-
-###############################################################################
-# Global container for option contract symbols (for real-time streaming)
-###############################################################################
-option_symbols_set = set()
 
 ###############################################################################
 # 2) Alpaca Trader Class
@@ -200,15 +182,45 @@ class AlpacaTrader:
             self.logger.error(f"get_account => {e}", exc_info=True)
             return None
 
+    async def get_position(self, symbol: str):
+        try:
+            pos = self.rest.get_position(symbol)
+            if float(pos.qty) == 0:
+                return None
+            return pos
+        except APIError as ex:
+            if "position does not exist" in str(ex).lower():
+                return None
+            self.logger.error(f"get_position => {ex}", exc_info=True)
+            return None
+        except Exception as e:
+            self.logger.error(f"get_position => {e}", exc_info=True)
+            return None
+
     async def submit_order(self, **kwargs):
         try:
-            # Do not remove asset_class for options orders.
+            kwargs.pop("asset_class", None)
             order = self.rest.submit_order(**kwargs)
             self.logger.info(f"Order Submitted => {order}")
             return order
         except Exception as e:
             self.logger.error(f"submit_order => {e}", exc_info=True)
             return None
+
+    async def close_position(self, symbol: str):
+        try:
+            orders = self.rest.list_orders(status="open", symbols=[symbol])
+            if orders:
+                self.logger.info(f"Cancelling {len(orders)} open orders for {symbol}")
+                for o in orders:
+                    self.rest.cancel_order(o.id)
+                await asyncio.sleep(1)
+            self.rest.close_position(symbol)
+            self.logger.info(f"Close position request sent for {symbol}")
+            return True
+        except Exception as e:
+            self.logger.error(f"close_position => {symbol}: {e}", exc_info=True)
+            return False
 
     async def get_latest_price(self, symbol: str):
         try:
@@ -222,84 +234,8 @@ class AlpacaTrader:
             self.logger.error(f"get_latest_price => {symbol}: {e}", exc_info=True)
             return None
 
-    def get_options_contracts(self, underlying: str, expiration_date_gte: str, expiration_date_lte: str) -> List[Dict]:
-        """
-        Fetches options contracts for a given underlying using Alpaca's v2 endpoint.
-        Reference: https://docs.alpaca.markets/reference/optionbars
-        """
-        options_rest = REST(
-            key_id=config["API_KEY"],
-            secret_key=config["API_SECRET"],
-            base_url=config.get("BASE_URL", "https://paper-api.alpaca.markets"),
-            api_version="v2"
-        )
-        query_params = {
-            "underlying_symbol": underlying,
-            "status": "active",
-            "expiration_date_gte": expiration_date_gte,
-            "expiration_date_lte": expiration_date_lte
-        }
-        query_string = urlencode(query_params)
-        url = f"/options/contracts?{query_string}"
-        try:
-            response = options_rest._request("GET", url)
-            data = response if isinstance(response, dict) else response.json()
-            return data.get("option_contracts", [])
-        except Exception as e:
-            self.logger.error(f"Error fetching options contracts for {underlying}: {e}", exc_info=True)
-            return []
-
 ###############################################################################
-# 3) Scan Best Option Contract
-###############################################################################
-def scan_best_option_contract(trader: AlpacaTrader, underlying: str, side: str) -> Optional[str]:
-    tomorrow = (datetime.now(timezone.utc) + timedelta(days=1)).strftime("%Y-%m-%d")
-    next_week = (datetime.now(timezone.utc) + timedelta(days=7)).strftime("%Y-%m-%d")
-    contracts = trader.get_options_contracts(underlying, tomorrow, next_week)
-    if not contracts:
-        logger.error(f"No options contracts found for {underlying}")
-        return None
-    candidates = []
-    for contract in contracts:
-        try:
-            delta = float(contract.get("delta", 0))
-            gamma = float(contract.get("gamma", 0))
-            open_interest = int(contract.get("open_interest", 0))
-        except Exception:
-            continue
-        if side == "long" and not (0.4 <= delta <= 0.6):
-            continue
-        if side == "short" and not (-0.6 <= delta <= -0.4):
-            continue
-        score = gamma * open_interest
-        candidates.append((score, contract))
-    if not candidates:
-        logger.error(f"No suitable contract found for {underlying} ({side})")
-        return None
-    best = max(candidates, key=lambda x: x[0])[1]
-    symbol = best.get("symbol")
-    option_symbols_set.add(symbol)
-    logger.info(f"Scanned best option for {underlying} ({side}): {symbol} (delta={best.get('delta')}, gamma={best.get('gamma')}, OI={best.get('open_interest')})")
-    return symbol
-
-async def process_options(underlying: str, trader: AlpacaTrader, logger: logging.Logger, side: str):
-    option_symbol = scan_best_option_contract(trader, underlying, side)
-    if option_symbol is None:
-        return
-    logger.info(f"Placing options trade for {underlying}: {option_symbol}")
-    order = await trader.submit_order(
-        symbol=option_symbol,
-        qty=1,
-        side="buy",
-        type="market",
-        time_in_force="gtc",
-        asset_class="option"
-    )
-    if order:
-        logger.info(f"Executed options order for {option_symbol}")
-
-###############################################################################
-# 4) Historical Data Fetching for Underlyings
+# 3) Dynamic Symbol Discovery and Initial History Fetching
 ###############################################################################
 def get_all_tradable_symbols(trader: AlpacaTrader, logger: logging.Logger) -> List[str]:
     try:
@@ -313,11 +249,13 @@ def get_all_tradable_symbols(trader: AlpacaTrader, logger: logging.Logger) -> Li
 
 async def fetch_initial_bars(symbol: str, trader: AlpacaTrader, logger: logging.Logger,
                                days: int = 5, timeframe: str = "15Min", use_cache: bool = True) -> pd.DataFrame:
+    # Try loading from cache if enabled.
     if use_cache:
         cached_df = load_cached_bars(symbol, timeframe, days)
         if cached_df is not None and not cached_df.empty:
             logger.info(f"Loaded cached bars for {symbol}")
             return cached_df
+
     try:
         end_utc = datetime.now(timezone.utc)
         start_utc = end_utc - timedelta(days=days)
@@ -335,7 +273,7 @@ async def fetch_initial_bars(symbol: str, trader: AlpacaTrader, logger: logging.
         return pd.DataFrame()
 
 ###############################################################################
-# 5) Transformer Network Components for RL
+# 4) Transformer Network Components (for RL Agent)
 ###############################################################################
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, dropout=0.1, max_len=5000):
@@ -343,7 +281,7 @@ class PositionalEncoding(nn.Module):
         self.dropout = nn.Dropout(p=dropout)
         pe = torch.zeros(max_len, d_model)
         position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0)/d_model))
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
         pe = pe.unsqueeze(0)
@@ -440,7 +378,7 @@ class TransformerDQN(nn.Module):
         return q_vals
 
 ###############################################################################
-# 5) Prioritized Replay Memory for RL Training
+# 5) Prioritized Replay Memory and Persistence
 ###############################################################################
 Transition = namedtuple('Transition', ('state', 'action', 'reward', 'next_state', 'done', 'cluster_id', 'history', 'next_history'))
 
@@ -495,7 +433,7 @@ class PrioritizedReplayMemoryPersistence:
         try:
             with open(self.filepath, 'rb') as f:
                 data = pickle.load(f)
-                memory.memory = data['memory']
+                memory.memory = deque(data['memory'], maxlen=memory.capacity)
                 memory.priorities = data['priorities']
                 memory.pos = data['pos']
             self.logger.info(f"Loaded replay memory from {self.filepath}")
@@ -503,7 +441,7 @@ class PrioritizedReplayMemoryPersistence:
             self.logger.error(f"Failed to load replay memory: {e}", exc_info=True)
 
 ###############################################################################
-# 6) TransformerAgent (RL Agent for Options Signals)
+# 6) TransformerAgent Definition (for RL)
 ###############################################################################
 class TransformerAgent:
     def __init__(
@@ -611,8 +549,8 @@ class TransformerAgent:
             return
         try:
             checkpoint = torch.load(filepath, map_location=self.device)
-            self.policy_net.load_state_dict(checkpoint['policy_net'], strict=False)
-            self.target_net.load_state_dict(checkpoint['target_net'], strict=False)
+            self.policy_net.load_state_dict(checkpoint['policy_net'])
+            self.target_net.load_state_dict(checkpoint['target_net'])
             self.optimizer.load_state_dict(checkpoint['optimizer'])
             self.steps_done = checkpoint.get('steps_done', 0)
             self.logger.info(f"Loaded checkpoint => {filepath}")
@@ -620,138 +558,43 @@ class TransformerAgent:
             self.logger.error(f"Failed to load checkpoint: {e}", exc_info=True)
 
 ###############################################################################
-# Trade State and Reward
+# 7) Enhanced Risk Manager Definitions
 ###############################################################################
-class TradeState:
+class AdaptiveRiskManager:
     def __init__(self):
-        self.active_trades = {}
-    def update_trade(self, symbol: str, entry_price: float, side: str):
-        now = datetime.now(timezone.utc)
-        if symbol not in self.active_trades:
-            if side == 'long':
-                stop_loss = entry_price * (1 - TRAILING_STOP_LOSS)
-                take_profit = entry_price * (1 + TAKE_PROFIT)
-            else:
-                stop_loss = entry_price * (1 + TRAILING_STOP_LOSS)
-                take_profit = entry_price * (1 - TAKE_PROFIT)
-            self.active_trades[symbol] = {
-                'entry_price': entry_price,
-                'side': side,
-                'entry_time': now,
-                'stop_loss': stop_loss,
-                'take_profit': take_profit
-            }
-    def adjust_stop_loss(self, symbol: str, current_price: float):
-        if symbol not in self.active_trades:
-            return
-        trade = self.active_trades[symbol]
-        side = trade['side']
-        if side == 'long' and current_price > trade['entry_price']:
-            new_sl = current_price * (1 - TRAILING_STOP_LOSS)
-            if new_sl > trade['stop_loss']:
-                trade['stop_loss'] = new_sl
-        elif side == 'short' and current_price < trade['entry_price']:
-            new_sl = current_price * (1 + TRAILING_STOP_LOSS)
-            if new_sl < trade['stop_loss']:
-                trade['stop_loss'] = new_sl
-    def check_exit(self, symbol: str, current_price: float, current_time: datetime, min_hold_days: int, max_hold_days: int) -> Optional[str]:
-        if symbol not in self.active_trades:
-            return None
-        trade = self.active_trades[symbol]
-        hold_duration = (current_time - trade['entry_time']).days
-        side = trade['side']
-        if side == 'long':
-            if current_price <= trade['stop_loss']:
-                del self.active_trades[symbol]
-                return 'stop_loss'
-            elif current_price >= trade['take_profit']:
-                del self.active_trades[symbol]
-                return 'take_profit'
+        self.win_rate = 0.5
+        self.consecutive_losses = 0
+        self.risk_multiplier = 1.0
+    def update_risk_parameters(self, trade_success: bool):
+        if trade_success:
+            self.consecutive_losses = 0
+            self.win_rate = 0.9 * self.win_rate + 0.1
         else:
-            if current_price >= trade['stop_loss']:
-                del self.active_trades[symbol]
-                return 'stop_loss'
-            elif current_price <= trade['take_profit']:
-                del self.active_trades[symbol]
-                return 'take_profit'
-        if hold_duration >= max_hold_days:
-            del self.active_trades[symbol]
-            return 'time_exit'
-        if hold_duration < min_hold_days:
-            return None
-        return None
+            self.consecutive_losses += 1
+            self.win_rate = 0.9 * self.win_rate
+        if self.consecutive_losses > 2:
+            self.risk_multiplier = max(0.5, 1.0 - 0.1 * self.consecutive_losses)
+        else:
+            self.risk_multiplier = min(2.0, 1.0 + (self.win_rate - 0.5))
 
-def get_reward(symbol: str, current_price: float, trade_state: TradeState) -> float:
-    if symbol in trade_state.active_trades:
-        trade = trade_state.active_trades[symbol]
-        entry_price = trade['entry_price']
-        side = trade['side']
-        return (current_price - entry_price) / entry_price if side == 'long' else (entry_price - current_price) / entry_price
-    return 0.0
-
-###############################################################################
-# 7) Build State and History from Bars
-###############################################################################
-def build_state(df: pd.DataFrame) -> torch.Tensor:
-    if df.empty:
-        return torch.zeros((1, 19), dtype=torch.float32).to(device)
-    last = df.iloc[-1]
-    feats = [last.get(col, 0.0) for col in [
-        'rsi', 'macd', 'macd_signal', 'macd_diff',
-        'bb_bbm', 'bb_bbh', 'bb_bbl', 'atr', 'adx',
-        'keltner_upper', 'keltner_lower', 'fib_23.6', 'fib_38.2',
-        'vw_macd', 'momentum_3d', 'hour_sin', 'hour_cos',
-        'day_sin', 'day_cos'
-    ]]
-    return torch.tensor(feats, dtype=torch.float32).unsqueeze(0).to(device)
-
-def build_history(df: pd.DataFrame, window: int = 10) -> torch.Tensor:
-    if df.empty:
-        return torch.zeros((1, window, 19), dtype=torch.float32).to(device)
-    if len(df) < window:
-        df_window = pd.concat([df.iloc[-1:]] * window)
-    else:
-        df_window = df.iloc[-window:]
-    seq = []
-    for _, row in df_window.iterrows():
-        seq.append([row.get(col, 0.0) for col in [
-            'rsi', 'macd', 'macd_signal', 'macd_diff',
-            'bb_bbm', 'bb_bbh', 'bb_bbl', 'atr', 'adx',
-            'keltner_upper', 'keltner_lower', 'fib_23.6', 'fib_38.2',
-            'vw_macd', 'momentum_3d', 'hour_sin', 'hour_cos',
-            'day_sin', 'day_cos'
-        ]])
-    return torch.tensor(seq, dtype=torch.float32).unsqueeze(0).to(device)
+class EnhancedRiskManager(AdaptiveRiskManager):
+    def get_position_size(self, capital, entry_price, atr, correlation_matrix):
+        if correlation_matrix is None or len(correlation_matrix) == 0:
+            corr_penalty = 1.0
+        else:
+            max_corr = np.max(np.abs(correlation_matrix))
+            corr_penalty = 1 - max_corr
+        risk_multiplier = self.risk_multiplier * corr_penalty
+        dynamic_atr_mult = VOL_TRAILING_MULTIPLIER if atr > entry_price * 0.01 else 1.8
+        risk_amount = capital * RISK_PER_TRADE * risk_multiplier
+        dollar_risk = atr * entry_price * dynamic_atr_mult
+        if dollar_risk <= 0:
+            return 0
+        shares = int(risk_amount / dollar_risk)
+        return max(shares, 0)
 
 ###############################################################################
-# 8) Options Module: Dynamic Options Screening & Order Placement
-###############################################################################
-def next_friday_expiration() -> datetime:
-    today = datetime.now(timezone.utc)
-    days_ahead = 4 - today.weekday()
-    if days_ahead <= 0:
-        days_ahead += 7
-    next_friday = today + timedelta(days=days_ahead)
-    return next_friday.replace(hour=16, minute=0, second=0, microsecond=0)
-
-async def process_options(underlying: str, trader: AlpacaTrader, logger: logging.Logger, side: str):
-    option_symbol = scan_best_option_contract(trader, underlying, side)
-    if option_symbol is None:
-        return
-    logger.info(f"Placing options trade for {underlying}: {option_symbol}")
-    order = await trader.submit_order(
-        symbol=option_symbol,
-        qty=1,
-        side="buy",
-        type="market",
-        time_in_force="gtc",
-        asset_class="option"
-    )
-    if order:
-        logger.info(f"Executed options order for {option_symbol}")
-
-###############################################################################
-# 9) Options Trading Engine: Process Underlying & Execute Option Trade
+# 8) Enhanced Indicators & Normalization
 ###############################################################################
 def compute_enhanced_indicators(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
@@ -788,7 +631,10 @@ def compute_enhanced_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df['day_sin'] = np.sin(2 * np.pi * df.index.dayofyear / 365.0)
     df['day_cos'] = np.cos(2 * np.pi * df.index.dayofyear / 365.0)
     df = df.ffill().bfill().dropna()
-    for col in ['rsi','macd','macd_signal','macd_diff','bb_bbm','bb_bbh','bb_bbl','atr','adx','keltner_upper','keltner_lower','fib_23.6','fib_38.2','vw_macd','momentum_3d','hour_sin','hour_cos','day_sin','day_cos']:
+    for col in ['rsi','macd','macd_signal','macd_diff',
+                'bb_bbm','bb_bbh','bb_bbl','atr','adx',
+                'keltner_upper','keltner_lower','fib_23.6','fib_38.2',
+                'vw_macd','momentum_3d','hour_sin','hour_cos','day_sin','day_cos']:
         if col in df.columns:
             lower = df[col].quantile(0.05)
             upper = df[col].quantile(0.95)
@@ -798,114 +644,103 @@ def compute_enhanced_indicators(df: pd.DataFrame) -> pd.DataFrame:
             df[col] = (df[col] - cmin) / (cmax - cmin)
     return df
 
-async def process_symbol(symbol: str, rl_agent: TransformerAgent, trader: AlpacaTrader, logger: logging.Logger, underlyings: List[str]):
-    df = compute_enhanced_indicators(pd.DataFrame(live_bars[symbol]))
-    if df.empty:
-        logger.info(f"{symbol} => Insufficient data for options trading.")
-        return
-    state = build_state(df).to(rl_agent.device)
-    hist_tensor = build_history(df, window=10).to(rl_agent.device)
-    try:
-        cluster_id = underlyings.index(symbol)
-    except Exception:
-        cluster_id = 0
-    rl_action = rl_agent.select_action(state, hist_tensor, cluster_id)
-    if rl_action == 0:
-        logger.info(f"{symbol} => RL Agent: Hold. No trade executed.")
-        return
-    if rl_action == 1:
-        logger.info(f"{symbol} => RL Agent Signal: Buy Call (long) option.")
-        await process_options(symbol, trader, logger, "long")
-    elif rl_action == 2:
-        logger.info(f"{symbol} => RL Agent Signal: Buy Put (short) option.")
-        await process_options(symbol, trader, logger, "short")
-    current_price = await trader.get_latest_price(symbol)
-    reward = get_reward(symbol, current_price, trade_state_instance) if current_price else 0.0
-    next_state = build_state(df).to(rl_agent.device)
-    next_history = build_history(df, window=10).to(rl_agent.device)
-    rl_agent.store_transition(state, rl_action, reward, next_state, 0, cluster_id, hist_tensor, next_history)
-    rl_agent.update_risk_mgr(trade_success=(reward > 0))
+def detect_market_regime(df: pd.DataFrame) -> str:
+    sma_50 = df['close'].rolling(50).mean()
+    sma_200 = df['close'].rolling(200).mean()
+    trend = "Bullish" if sma_50.iloc[-1] > sma_200.iloc[-1] else "Bearish"
+    adx_val = df['adx'].iloc[-1] if 'adx' in df.columns else 20
+    volatility = df['atr'].iloc[-1] / df['close'].iloc[-1] if 'atr' in df.columns else 0
+    if adx_val > 25 and volatility > 0.015:
+        return f"{trend}_Trending"
+    elif adx_val < 20 and volatility < 0.01:
+        return f"{trend}_Range"
+    return f"{trend}_Transitional"
 
 ###############################################################################
-# 10) Live Bars Storage and Websocket Callback
+# 9) Bollinger-Based Risk–Reward Ratio Calculation
 ###############################################################################
-live_bars: Dict[str, List[Dict]] = {}
-
-async def on_bar_callback(bar):
-    timestamp = getattr(bar, "timestamp", bar._raw.get("timestamp"))
-    open_price = getattr(bar, "open", bar._raw.get("open"))
-    high_price = getattr(bar, "high", bar._raw.get("high"))
-    low_price = getattr(bar, "low", bar._raw.get("low"))
-    close_price = getattr(bar, "close", bar._raw.get("close"))
-    volume = getattr(bar, "volume", bar._raw.get("volume"))
-    symbol = bar.symbol
-    bar_dict = {
-        "timestamp": timestamp,
-        "open": open_price,
-        "high": high_price,
-        "low": low_price,
-        "close": close_price,
-        "volume": volume
-    }
-    if symbol not in live_bars:
-        live_bars[symbol] = []
-    live_bars[symbol].append(bar_dict)
-    if len(live_bars[symbol]) > 50:
-        live_bars[symbol] = live_bars[symbol][-50:]
-    if len(live_bars[symbol]) >= 10:
-        asyncio.create_task(process_symbol(symbol, rl_instance.agent, trader_instance, logger, dynamic_underlyings))
+def compute_bollinger_ratios(df: pd.DataFrame) -> Tuple[float, float]:
+    bb = BollingerBands(close=df['close'], window=20, window_dev=2)
+    last_price = df.iloc[-1]['close']
+    lower = bb.bollinger_lband().iloc[-1]
+    upper = bb.bollinger_hband().iloc[-1]
+    long_ratio = (upper - last_price) / (last_price - lower) if last_price > lower else 0
+    short_ratio = (last_price - lower) / (upper - last_price) if upper > last_price else 0
+    return long_ratio, short_ratio
 
 ###############################################################################
-# 11) Options WebSocket Callback for Real-Time Option Data
+# 10) Trade State and Reward
 ###############################################################################
-def on_option_message(msg):
-    # Message is decoded from msgpack automatically by the Alpaca SDK.
-    if msg.get("T") == "t":
-        logger.info(f"Option Trade: {msg}")
-    elif msg.get("T") == "q":
-        logger.info(f"Option Quote: {msg}")
-    elif msg.get("T") == "error":
-        logger.error(f"Option Stream Error: {msg}")
+class TradeState:
+    def __init__(self):
+        self.active_trades = {}
+    def update_trade(self, symbol: str, entry_price: float, side: str):
+        now = datetime.now(timezone.utc)
+        if symbol not in self.active_trades:
+            if side == 'long':
+                stop_loss = entry_price * (1 - TRAILING_STOP_LOSS)
+                take_profit = entry_price * (1 + TAKE_PROFIT)
+            else:
+                stop_loss = entry_price * (1 + TRAILING_STOP_LOSS)
+                take_profit = entry_price * (1 - TAKE_PROFIT)
+            self.active_trades[symbol] = {
+                'entry_price': entry_price,
+                'side': side,
+                'entry_time': now,
+                'stop_loss': stop_loss,
+                'take_profit': take_profit
+            }
+    def adjust_stop_loss(self, symbol: str, current_price: float):
+        if symbol not in self.active_trades:
+            return
+        trade = self.active_trades[symbol]
+        side = trade['side']
+        if side == 'long' and current_price > trade['entry_price']:
+            new_sl = current_price * (1 - TRAILING_STOP_LOSS)
+            if new_sl > trade['stop_loss']:
+                trade['stop_loss'] = new_sl
+        elif side == 'short' and current_price < trade['entry_price']:
+            new_sl = current_price * (1 + TRAILING_STOP_LOSS)
+            if new_sl < trade['stop_loss']:
+                trade['stop_loss'] = new_sl
+    def check_exit(self, symbol: str, current_price: float, current_time: datetime,
+                   min_hold_days: int, max_hold_days: int) -> Optional[str]:
+        if symbol not in self.active_trades:
+            return None
+        trade = self.active_trades[symbol]
+        hold_duration = (current_time - trade['entry_time']).days
+        side = trade['side']
+        if side == 'long':
+            if current_price <= trade['stop_loss']:
+                del self.active_trades[symbol]
+                return 'stop_loss'
+            elif current_price >= trade['take_profit']:
+                del self.active_trades[symbol]
+                return 'take_profit'
+        else:
+            if current_price >= trade['stop_loss']:
+                del self.active_trades[symbol]
+                return 'stop_loss'
+            elif current_price <= trade['take_profit']:
+                del self.active_trades[symbol]
+                return 'take_profit'
+        if hold_duration >= max_hold_days:
+            del self.active_trades[symbol]
+            return 'time_exit'
+        if hold_duration < min_hold_days:
+            return None
+        return None
+
+def get_reward(symbol: str, current_price: float, trade_state: TradeState) -> float:
+    if symbol in trade_state.active_trades:
+        trade = trade_state.active_trades[symbol]
+        entry_price = trade['entry_price']
+        side = trade['side']
+        return (current_price - entry_price) / entry_price if side == 'long' else (entry_price - current_price) / entry_price
+    return 0.0
 
 ###############################################################################
-# 12) RL Optimization Loop (Optional Training)
-###############################################################################
-async def rl_optimization_loop():
-    episode = 0
-    while True:
-        try:
-            beta = min(1.0, rl_instance.agent.beta_start + episode * (1.0 - rl_instance.agent.beta_start) / rl_instance.agent.beta_frames)
-            rl_instance.optimize(beta)
-            if episode % TARGET_UPDATE == 0:
-                rl_instance.update_target()
-            if episode % 100 == 0:
-                rl_instance.save_agent()
-            episode += 1
-            await asyncio.sleep(60)
-        except Exception as e:
-            logger.error(f"Error in RL optimization loop: {e}", exc_info=True)
-            await asyncio.sleep(60)
-
-async def proprietary_training_loop():
-    while True:
-        try:
-            await train_proprietary_predictor()
-            await asyncio.sleep(120)
-        except Exception as e:
-            logger.error(f"Error in ProprietaryPredictor training loop: {e}", exc_info=True)
-            await asyncio.sleep(120)
-
-async def pattern_training_loop():
-    while True:
-        try:
-            await train_pattern_predictor()
-            await asyncio.sleep(120)
-        except Exception as e:
-            logger.error(f"Error in PatternPredictor training loop: {e}", exc_info=True)
-            await asyncio.sleep(120)
-
-###############################################################################
-# 13) RLTrader Wrapper for Options Trading and Risk Management
+# 11) RLTrader Wrapper
 ###############################################################################
 class RLTrader:
     def __init__(self, device: torch.device, logger: logging.Logger,
@@ -913,11 +748,12 @@ class RLTrader:
         self.device = device
         self.logger = logger
         self.state_dim = 19
-        self.action_dim = 3  # 0=Hold, 1=Call, 2=Put
+        self.action_dim = 3
+        self.num_clusters = 10
         self.agent = TransformerAgent(
             in_dim=self.state_dim,
             out_dim=self.action_dim,
-            num_clusters=10,
+            num_clusters=self.num_clusters,
             device=device,
             memory_size=MEMORY_SIZE,
             batch_size=BATCH_SIZE,
@@ -956,43 +792,430 @@ class RLTrader:
         return self.risk_manager.get_position_size(capital, entry_price, atr, correlation_matrix)
 
 ###############################################################################
-# 14) Enhanced Risk Manager Definitions
+# 12) Logging Helpers
 ###############################################################################
-class AdaptiveRiskManager:
-    def __init__(self):
-        self.win_rate = 0.5
-        self.consecutive_losses = 0
-        self.risk_multiplier = 1.0
-    def update_risk_parameters(self, trade_success: bool):
-        if trade_success:
-            self.consecutive_losses = 0
-            self.win_rate = 0.9 * self.win_rate + 0.1
-        else:
-            self.consecutive_losses += 1
-            self.win_rate = 0.9 * self.win_rate
-        if self.consecutive_losses > 2:
-            self.risk_multiplier = max(0.5, 1.0 - 0.1 * self.consecutive_losses)
-        else:
-            self.risk_multiplier = min(2.0, 1.0 + (self.win_rate - 0.5))
+def record_trade(trade_details: Dict, logger: logging.Logger):
+    try:
+        logger.info(f"Trade Recorded: {trade_details}")
+        with open("trade_log.json", "a") as f:
+            json.dump(trade_details, f)
+            f.write('\n')
+    except Exception as e:
+        logger.error(f"Error recording trade: {e}", exc_info=True)
 
-class EnhancedRiskManager(AdaptiveRiskManager):
-    def get_position_size(self, capital, entry_price, atr, correlation_matrix):
-        if correlation_matrix is None or len(correlation_matrix) == 0:
-            corr_penalty = 1.0
-        else:
-            max_corr = np.max(np.abs(correlation_matrix))
-            corr_penalty = 1 - max_corr
-        risk_multiplier = self.risk_multiplier * corr_penalty
-        dynamic_atr_mult = VOL_TRAILING_MULTIPLIER if atr > entry_price * 0.01 else 1.8
-        risk_amount = capital * RISK_PER_TRADE * risk_multiplier
-        dollar_risk = atr * entry_price * dynamic_atr_mult
-        if dollar_risk <= 0:
-            return 0
-        shares = int(risk_amount / dollar_risk)
-        return max(shares, 0)
+async def cancel_open_orders_for_symbol(symbol: str, trader: AlpacaTrader, logger: logging.Logger):
+    try:
+        open_orders = trader.rest.list_orders(status="open", symbols=[symbol])
+        if open_orders:
+            logger.info(f"Cancelling {len(open_orders)} open orders for {symbol}")
+            for order in open_orders:
+                trader.rest.cancel_order(order.id)
+            await asyncio.sleep(1)
+    except Exception as e:
+        logger.error(f"cancel_open_orders_for_symbol => {symbol}: {e}", exc_info=True)
+
+async def close_any_position(symbol: str, trader: AlpacaTrader, logger: logging.Logger):
+    pos = await trader.get_position(symbol)
+    if pos:
+        success = await trader.close_position(symbol)
+        if success:
+            logger.info(f"Closed position for {symbol}")
+            trade_details = {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "symbol": symbol,
+                "action": f"Close_{pos.side}",
+                "qty": abs(int(float(pos.qty))),
+                "price": float(pos.avg_entry_price),
+                "timestamp_closed": datetime.now(timezone.utc).isoformat()
+            }
+            record_trade(trade_details, logger)
 
 ###############################################################################
-# 15) Main Function: Initialization, WebSocket Subscriptions & Option Stream
+# 13) Build State and History
+###############################################################################
+def build_state(df: pd.DataFrame) -> torch.Tensor:
+    if df.empty:
+        return torch.zeros((1, 19), dtype=torch.float32).to(device)
+    last = df.iloc[-1]
+    feats = [last.get(col, 0.0) for col in [
+        'rsi', 'macd', 'macd_signal', 'macd_diff',
+        'bb_bbm', 'bb_bbh', 'bb_bbl', 'atr', 'adx',
+        'keltner_upper', 'keltner_lower', 'fib_23.6', 'fib_38.2',
+        'vw_macd', 'momentum_3d', 'hour_sin', 'hour_cos',
+        'day_sin', 'day_cos'
+    ]]
+    return torch.tensor(feats, dtype=torch.float32).unsqueeze(0).to(device)
+
+def build_history(df: pd.DataFrame, window: int = 10) -> torch.Tensor:
+    if df.empty:
+        return torch.zeros((1, window, 19), dtype=torch.float32).to(device)
+    if len(df) < window:
+        df_window = pd.concat([df.iloc[-1:]] * window)
+    else:
+        df_window = df.iloc[-window:]
+    seq = []
+    for _, row in df_window.iterrows():
+        seq.append([row.get(col, 0.0) for col in [
+            'rsi', 'macd', 'macd_signal', 'macd_diff',
+            'bb_bbm', 'bb_bbh', 'bb_bbl', 'atr', 'adx',
+            'keltner_upper', 'keltner_lower', 'fib_23.6', 'fib_38.2',
+            'vw_macd', 'momentum_3d', 'hour_sin', 'hour_cos',
+            'day_sin', 'day_cos'
+        ]])
+    return torch.tensor(seq, dtype=torch.float32).unsqueeze(0).to(device)
+
+###############################################################################
+# 14) PatternPredictor: LSTM for Intraday Pattern Forecasting
+###############################################################################
+class PatternPredictor(nn.Module):
+    def __init__(self, input_dim=8, hidden_dim=64, num_layers=1, output_dim=1):
+        super(PatternPredictor, self).__init__()
+        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True)
+        self.fc = nn.Linear(hidden_dim, output_dim)
+    def forward(self, x):
+        out, _ = self.lstm(x)
+        out = out[:, -1, :]
+        out = self.fc(out)
+        return out
+
+pattern_predictor = PatternPredictor().to(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+pattern_optimizer = optim.Adam(pattern_predictor.parameters(), lr=0.001)
+pattern_loss_fn = nn.MSELoss()
+pattern_dataset = []
+
+async def train_pattern_predictor():
+    global pattern_dataset
+    if not pattern_dataset:
+        return
+    inputs = torch.cat([pair[0] for pair in pattern_dataset], dim=0).to(device)
+    targets = torch.cat([pair[1] for pair in pattern_dataset], dim=0).to(device)
+    pattern_optimizer.zero_grad()
+    outputs = pattern_predictor(inputs)
+    loss = pattern_loss_fn(outputs, targets)
+    loss.backward()
+    pattern_optimizer.step()
+    logger.info(f"PatternPredictor training loss: {loss.item():.6f}")
+    pattern_dataset = []
+
+###############################################################################
+# 15) ProprietaryMarketPredictor: Our Cutting-Edge Neural Model
+###############################################################################
+class ProprietaryMarketPredictor(nn.Module):
+    """
+    Our proprietary multi–modal neural model that fuses technical data and Alpaca news sentiment
+    to predict the next bar's percentage return.
+    """
+    def __init__(self, tech_input_dim, sentiment_input_dim, hidden_dim=128, num_layers=2, output_dim=1):
+        super(ProprietaryMarketPredictor, self).__init__()
+        self.tech_lstm = nn.LSTM(tech_input_dim, hidden_dim, num_layers, batch_first=True)
+        self.sentiment_fc = nn.Sequential(
+            nn.Linear(sentiment_input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+        self.combined_fc = nn.Sequential(
+            nn.Linear(2 * hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, output_dim)
+        )
+    def forward(self, tech_input, sentiment_input):
+        tech_out, _ = self.tech_lstm(tech_input)
+        tech_feature = tech_out[:, -1, :]
+        sentiment_feature = self.sentiment_fc(sentiment_input)
+        combined = torch.cat([tech_feature, sentiment_feature], dim=1)
+        output = self.combined_fc(combined)
+        return output
+
+proprietary_predictor = ProprietaryMarketPredictor(tech_input_dim=19, sentiment_input_dim=1).to(device)
+proprietary_optimizer = optim.Adam(proprietary_predictor.parameters(), lr=0.001)
+proprietary_loss_fn = nn.MSELoss()
+proprietary_dataset = []
+
+async def train_proprietary_predictor():
+    global proprietary_dataset
+    if not proprietary_dataset:
+        return
+    inputs = torch.cat([pair[0] for pair in proprietary_dataset], dim=0).to(device)
+    targets = torch.cat([pair[1] for pair in proprietary_dataset], dim=0).to(device)
+    proprietary_optimizer.zero_grad()
+    sentiment_input = torch.zeros(inputs.size(0), 1).to(device)
+    outputs = proprietary_predictor(inputs, sentiment_input)
+    loss = proprietary_loss_fn(outputs, targets)
+    loss.backward()
+    proprietary_optimizer.step()
+    logger.info(f"ProprietaryPredictor training loss: {loss.item():.6f}")
+    proprietary_dataset = []
+
+###############################################################################
+# 15) Options Module: Gamma Scalping with Real Option Orders
+###############################################################################
+def next_friday_expiration() -> datetime:
+    today = datetime.now(timezone.utc)
+    days_ahead = 4 - today.weekday()
+    if days_ahead <= 0:
+        days_ahead += 7
+    next_friday = today + timedelta(days=days_ahead)
+    expiration = next_friday.replace(hour=16, minute=0, second=0, microsecond=0)
+    return expiration
+
+def build_option_symbol(underlying: str, underlying_price: float, is_call: bool) -> str:
+    expiration = next_friday_expiration()
+    strike = int(round(underlying_price, 2) * 1000)
+    option_type = 'C' if is_call else 'P'
+    option_symbol = f"{underlying}{expiration.strftime('%y%m%d')}{option_type}{strike:08d}"
+    return option_symbol
+
+async def process_options(underlying: str, underlying_price: float, trader: AlpacaTrader, logger: logging.Logger, side: str):
+    is_call = True if side == "long" else False
+    option_symbol = build_option_symbol(underlying, underlying_price, is_call)
+    logger.info(f"Placing options trade for {underlying}: {option_symbol}")
+    order = await trader.submit_order(
+        symbol=option_symbol,
+        qty=1,
+        side="buy",
+        type="market",
+        time_in_force="gtc"
+    )
+    if order:
+        logger.info(f"Executed options order for {option_symbol}")
+
+###############################################################################
+# 16) Global Live Bars Storage and Websocket Callback
+###############################################################################
+live_bars: Dict[str, List[Dict]] = {}
+previous_predictor_input: Dict[str, torch.Tensor] = {}
+
+def get_news_sentiment(symbol: str) -> float:
+    try:
+        news_items = trader_instance.rest.get_news(symbol=symbol, limit=5)
+        if not news_items:
+            return 0.0
+        scores = []
+        for item in news_items:
+            headline = item.headline
+            results = sentiment_analyzer(headline)
+            score = 1 if results[0]['label'].lower() == "positive" else -1
+            scores.append(score)
+        return sum(scores) / len(scores)
+    except Exception as e:
+        logger.error(f"Error fetching news for {symbol}: {e}", exc_info=True)
+        return 0.0
+
+async def on_bar_callback(bar):
+    timestamp = getattr(bar, "timestamp", bar._raw.get("timestamp"))
+    open_price = getattr(bar, "open", bar._raw.get("open"))
+    high_price = getattr(bar, "high", bar._raw.get("high"))
+    low_price = getattr(bar, "low", bar._raw.get("low"))
+    close_price = getattr(bar, "close", bar._raw.get("close"))
+    volume = getattr(bar, "volume", bar._raw.get("volume"))
+    symbol = bar.symbol
+    bar_dict = {
+        "timestamp": timestamp,
+        "open": open_price,
+        "high": high_price,
+        "low": low_price,
+        "close": close_price,
+        "volume": volume
+    }
+    if symbol not in live_bars:
+        live_bars[symbol] = []
+    live_bars[symbol].append(bar_dict)
+    if len(live_bars[symbol]) > 50:
+        live_bars[symbol] = live_bars[symbol][-50:]
+    if len(live_bars[symbol]) >= 10:
+        df = pd.DataFrame(live_bars[symbol])
+        try:
+            df = compute_enhanced_indicators(df)
+            predictor_features = df[['rsi', 'macd', 'atr', 'adx', 'hour_sin', 'hour_cos', 'day_sin', 'day_cos']].tail(10)
+            if predictor_features.empty or predictor_features.shape[0] == 0:
+                logger.warning(f"{symbol} => Predictor features are empty, skipping pattern prediction.")
+                return
+            predictor_input = torch.tensor(predictor_features.values, dtype=torch.float32).unsqueeze(0).to(device)
+            with torch.no_grad():
+                pattern_prediction = pattern_predictor(predictor_input).item()
+            news_sentiment = get_news_sentiment(symbol)
+            tech_input = build_history(df, window=10).to(device)
+            sentiment_input = torch.tensor([[news_sentiment]], dtype=torch.float32).to(device)
+            with torch.no_grad():
+                proprietary_prediction = proprietary_predictor(tech_input, sentiment_input).item()
+            combined_prediction = (pattern_prediction + proprietary_prediction) / 2
+            if symbol in previous_predictor_input:
+                prev_df = pd.DataFrame(live_bars[symbol])
+                if len(prev_df) >= 2:
+                    actual_return = (prev_df.iloc[-1]['close'] - prev_df.iloc[-2]['close']) / prev_df.iloc[-2]['close']
+                    pattern_dataset.append((previous_predictor_input[symbol], torch.tensor([[actual_return]], dtype=torch.float32).to(device)))
+                    proprietary_dataset.append((tech_input, torch.tensor([[actual_return]], dtype=torch.float32).to(device)))
+            previous_predictor_input[symbol] = predictor_input
+            asyncio.create_task(process_symbol_live(symbol, df, combined_prediction))
+        except Exception as e:
+            logger.error(f"Error processing live bars for {symbol}: {e}", exc_info=True)
+    if TRADE_OPTIONS:
+        if high_price - low_price > 0.02 * close_price:
+            side_choice = "long" if random.random() < 0.5 else "short"
+            asyncio.create_task(process_options(symbol, close_price, trader_instance, logger, side_choice))
+
+async def process_symbol_live(symbol: str, df: pd.DataFrame, combined_prediction: float):
+    if symbol in global_symbols:
+        symbol_id = global_symbols.index(symbol)
+    else:
+        symbol_id = 0
+    await process_symbol(symbol, rl_instance, trader_instance, logger, trade_state_instance, symbol_id, {}, global_symbols, combined_prediction)
+
+###############################################################################
+# 17) Main Processing: Ensemble Decision Engine for Stocks
+###############################################################################
+async def process_symbol(symbol: str, rl: RLTrader, trader: AlpacaTrader, logger: logging.Logger,
+                         trade_state: TradeState, symbol_id: int, data_map: Dict[str, pd.DataFrame],
+                         all_symbols: List[str], combined_prediction: float):
+    df = compute_enhanced_indicators(pd.DataFrame(live_bars[symbol]))
+    if df.empty:
+        logger.info(f"{symbol} => Insufficient data after indicator computation.")
+        return
+    long_ratio, short_ratio = compute_bollinger_ratios(pd.DataFrame(live_bars[symbol]))
+    state = build_state(df).to(rl.device)
+    hist_tensor = build_history(df, window=10).to(rl.device)
+    regime = detect_market_regime(df)
+    ma_signal = 1 if "Bullish" in regime and "Trending" in regime else 0
+    rsi_value = state[0, 0].item()
+    rl_action = rl.pick_action(state, hist_tensor, symbol_id)
+    if combined_prediction > 0.005:
+        combined_action = 1
+    elif combined_prediction < -0.005:
+        combined_action = 2
+    else:
+        combined_action = rl_action
+    if combined_action == 1:
+        if (long_ratio < 5) or (rsi_value > 0.8):
+            logger.info(f"{symbol} => Filtering Long: MA={ma_signal}, RSI={rsi_value:.2f}, Long Ratio={long_ratio:.2f}. Forcing Hold.")
+            action = 0
+        else:
+            action = 1
+    elif combined_action == 2:
+        if (short_ratio < 5) or (rsi_value < 0.2):
+            logger.info(f"{symbol} => Filtering Short: MA={ma_signal}, RSI={rsi_value:.2f}, Short Ratio={short_ratio:.2f}. Forcing Hold.")
+            action = 0
+        else:
+            action = 2
+    else:
+        action = combined_action
+    logger.info(f"{symbol} => Final stock action: {action} (Combined prediction: {combined_prediction:.4f})")
+    current_atr = float(df.iloc[-1]['atr']) if 'atr' in df.columns else 1.0
+    acct = await trader.get_account()
+    if not acct:
+        return
+    equity = float(acct.equity)
+    corr_mat = np.random.uniform(-0.3, 0.3, (len(all_symbols), len(all_symbols)))
+    position_size = rl.get_position_size(equity, float(df.iloc[-1]['close']), current_atr, corr_mat)
+    await apply_action(symbol, action, trader, logger, trade_state, rl, current_atr, position_size)
+    pos = await trader.get_position(symbol)
+    if pos:
+        entry_price = float(pos.avg_entry_price)
+        if symbol not in trade_state.active_trades:
+            side = 'long' if action == 1 else 'short'
+            trade_state.update_trade(symbol, entry_price, side)
+        current_price = await trader.get_latest_price(symbol)
+        if current_price:
+            trade_state.adjust_stop_loss(symbol, current_price)
+    current_price = await trader.get_latest_price(symbol)
+    if current_price:
+        exit_reason = trade_state.check_exit(symbol, current_price, datetime.now(timezone.utc), MIN_HOLD_DAYS, MAX_HOLD_DAYS)
+        if exit_reason:
+            logger.info(f"{symbol} => Exiting trade due to {exit_reason}")
+            await close_any_position(symbol, trader, logger)
+            trade_state.active_trades.pop(symbol, None)
+    reward = get_reward(symbol, current_price, trade_state)
+    next_state = build_state(df).to(rl.device)
+    next_history = build_history(df, window=10).to(rl.device)
+    done = 0
+    rl.store_transition(state, action, reward, next_state, done, symbol_id, hist_tensor, next_history)
+    rl.update_risk_mgr(trade_success=(reward > 0))
+
+async def apply_action(symbol: str, action: int, trader: AlpacaTrader, logger: logging.Logger,
+                       trade_state: TradeState, rl: RLTrader, atr_value: float, shares: int):
+    acct = await trader.get_account()
+    if not acct:
+        return
+    last_price = await trader.get_latest_price(symbol)
+    if not last_price or last_price <= 0:
+        logger.info(f"{symbol} => Invalid price. Skipping action.")
+        return
+    await cancel_open_orders_for_symbol(symbol, trader, logger)
+    pos = await trader.get_position(symbol)
+    current_qty = float(pos.qty) if pos else 0
+    if action == 0:
+        logger.info(f"{symbol} => Hold action. No trade executed.")
+        return
+    if shares <= 0:
+        logger.info(f"{symbol} => Computed shares=0. Skipping trade.")
+        return
+    if action == 1:
+        if current_qty > 0:
+            logger.info(f"{symbol} => Already long. Skipping entry.")
+        else:
+            if current_qty < 0:
+                logger.info(f"{symbol} => Closing short before long entry.")
+                await trader.submit_order(symbol=symbol, qty=abs(int(current_qty)), side="buy", type="market", time_in_force="gtc")
+                await asyncio.sleep(1)
+            order = await trader.submit_order(symbol=symbol, qty=shares, side="buy", type="market", time_in_force="gtc")
+            if order:
+                logger.info(f"{symbol} => Opened long: {shares} shares.")
+                trade_details = {"timestamp": datetime.now(timezone.utc).isoformat(), "symbol": symbol, "action": "Buy", "qty": shares, "price": last_price}
+                record_trade(trade_details, logger)
+                trade_state.update_trade(symbol, last_price, 'long')
+    elif action == 2:
+        if current_qty < 0:
+            logger.info(f"{symbol} => Already short. Skipping entry.")
+        else:
+            if current_qty > 0:
+                logger.info(f"{symbol} => Closing long before short entry.")
+                await trader.submit_order(symbol=symbol, qty=abs(int(current_qty)), side="sell", type="market", time_in_force="gtc")
+                await asyncio.sleep(1)
+            order = await trader.submit_order(symbol=symbol, qty=shares, side="sell", type="market", time_in_force="gtc")
+            if order:
+                logger.info(f"{symbol} => Opened short: {shares} shares.")
+                trade_details = {"timestamp": datetime.now(timezone.utc).isoformat(), "symbol": symbol, "action": "Short", "qty": shares, "price": last_price}
+                record_trade(trade_details, logger)
+                trade_state.update_trade(symbol, last_price, 'short')
+
+###############################################################################
+# 17) RL and Proprietary Predictor Optimization Loops
+###############################################################################
+async def rl_optimization_loop():
+    episode = 0
+    while True:
+        try:
+            beta = min(1.0, rl_instance.agent.beta_start + episode * (1.0 - rl_instance.agent.beta_start) / rl_instance.agent.beta_frames)
+            rl_instance.optimize(beta)
+            if episode % TARGET_UPDATE == 0:
+                rl_instance.update_target()
+            if episode % 100 == 0:
+                rl_instance.save_agent()
+            episode += 1
+            await asyncio.sleep(60)
+        except Exception as e:
+            logger.error(f"Error in RL optimization loop: {e}", exc_info=True)
+            await asyncio.sleep(60)
+
+async def proprietary_training_loop():
+    while True:
+        try:
+            await train_proprietary_predictor()
+            await asyncio.sleep(120)
+        except Exception as e:
+            logger.error(f"Error in ProprietaryPredictor training loop: {e}", exc_info=True)
+            await asyncio.sleep(120)
+
+async def pattern_training_loop():
+    while True:
+        try:
+            await train_pattern_predictor()
+            await asyncio.sleep(120)
+        except Exception as e:
+            logger.error(f"Error in PatternPredictor training loop: {e}", exc_info=True)
+            await asyncio.sleep(120)
+
+###############################################################################
+# 18) Main Function: Initialize History, Filter Symbols, Start Websocket Stream, and Loops
 ###############################################################################
 global_symbols: List[str] = []
 
@@ -1018,9 +1241,8 @@ async def main():
     stream = Stream(API_KEY, API_SECRET, base_url=BASE_URL, data_feed="iex")
     stream.subscribe_bars(on_bar_callback, *global_symbols)
     asyncio.create_task(rl_optimization_loop())
-    # Uncomment the following if you want to train your proprietary/pattern predictors:
-    # asyncio.create_task(proprietary_training_loop())
-    # asyncio.create_task(pattern_training_loop())
+    asyncio.create_task(proprietary_training_loop())
+    asyncio.create_task(pattern_training_loop())
     stream.run()
 
 ###############################################################################
@@ -1030,11 +1252,10 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Keyboard interrupt. Saving agent and exiting.")
+        logger.info("Keyboard interrupt. Saving agents and exiting.")
         if rl_instance:
             rl_instance.save_agent()
     except Exception as e:
         logger.critical(f"Unhandled exception: {e}", exc_info=True)
         if rl_instance:
             rl_instance.save_agent()
-
