@@ -231,6 +231,16 @@ class AlpacaTrader:
             self.logger.error(f"get_latest_price => {symbol}: {e}", exc_info=True)
             return None
 
+    # NEW: Method to fetch the options chain for an underlying asset.
+    def get_options_chain(self, underlying: str):
+        try:
+            # Adjust this call based on the actual Alpaca options API.
+            chain = self.rest.get_options_chain(underlying)
+            return chain
+        except Exception as e:
+            self.logger.error(f"Error fetching options chain for {underlying}: {e}", exc_info=True)
+            return []
+
 ###############################################################################
 # 3) Dynamic Symbol Discovery and Initial History Fetching
 ###############################################################################
@@ -961,19 +971,26 @@ def build_option_symbol(underlying: str, underlying_price: float, is_call: bool)
     option_symbol = f"{underlying}{expiration.strftime('%y%m%d')}{option_type}{strike:08d}"
     return option_symbol
 
+# UPDATED: In process_options, we fetch the options chain and compare the generated symbol.
 async def process_options(underlying: str, underlying_price: float, trader: AlpacaTrader, logger: logging.Logger, side: str):
     is_call = True if side == "long" else False
-    option_symbol = build_option_symbol(underlying, underlying_price, is_call)
-    logger.info(f"Placing options trade for {underlying}: {option_symbol}")
+    generated_symbol = build_option_symbol(underlying, underlying_price, is_call)
+    # Fetch options chain using the new method in AlpacaTrader.
+    options_chain = trader.get_options_chain(underlying)
+    option_symbols = [opt['symbol'] for opt in options_chain] if options_chain else []
+    if generated_symbol not in option_symbols:
+        logger.error(f"Generated option symbol {generated_symbol} not found in options chain for {underlying}. Available symbols: {option_symbols}")
+        return
+    logger.info(f"Placing options trade for {underlying}: {generated_symbol}")
     order = await trader.submit_order(
-        symbol=option_symbol,
+        symbol=generated_symbol,
         qty=1,
         side="buy",
         type="market",
         time_in_force="gtc"
     )
     if order:
-        logger.info(f"Executed options order for {option_symbol}")
+        logger.info(f"Executed options order for {generated_symbol}")
 
 ###############################################################################
 # 16) Global Live Bars Storage and Websocket Callback
@@ -1162,7 +1179,7 @@ async def apply_action(symbol: str, action: int, trader: AlpacaTrader, logger: l
                 trade_details = {"timestamp": datetime.now(timezone.utc).isoformat(), "symbol": symbol, "action": "Buy", "qty": shares, "price": last_price}
                 record_trade(trade_details, logger)
                 trade_state.update_trade(symbol, last_price, 'long')
-                rl.save_agent()  # Save state immediately after trade action
+                rl.save_agent()  # Save state after trade
     elif action == 2:
         if current_qty < 0:
             logger.info(f"{symbol} => Already short. Skipping entry.")
@@ -1177,7 +1194,7 @@ async def apply_action(symbol: str, action: int, trader: AlpacaTrader, logger: l
                 trade_details = {"timestamp": datetime.now(timezone.utc).isoformat(), "symbol": symbol, "action": "Short", "qty": shares, "price": last_price}
                 record_trade(trade_details, logger)
                 trade_state.update_trade(symbol, last_price, 'short')
-                rl.save_agent()  # Save state immediately after trade action
+                rl.save_agent()  # Save state after trade
 
 ###############################################################################
 # 17) RL and Proprietary Predictor Optimization Loops
