@@ -5,8 +5,8 @@ Production-Ready Options Trading Bot with Dynamic Options Screening & Advanced R
 This bot uses Alpaca’s options contracts endpoint (via a dedicated REST client with api_version="v2")
 to dynamically retrieve options chain data, select top underlyings based on liquidity and Greeks,
 and then uses a transformer-based deep Q-network (RL agent) to decide whether to trade a call or put option.
-Option orders are submitted using the option symbol returned from our scanning function.
-A dedicated websocket subscriber receives real-time option data (msgpack).
+Option orders are submitted using the selected contract from our scanning function.
+A dedicated websocket subscriber receives real-time option data.
 The bot also uses technical indicators, risk management, and additional predictors for enhanced decision making.
 
 Before deploying:
@@ -165,7 +165,7 @@ logger.info(f"Device set to use {device}")
 # Global containers
 ###############################################################################
 option_symbols_set = set()
-dynamic_underlyings = []   # Global list for the selected underlyings for options trading
+dynamic_underlyings = []   # Selected underlyings for options trading
 live_bars: Dict[str, List[Dict]] = {}
 
 ###############################################################################
@@ -223,6 +223,7 @@ class AlpacaTrader:
             self.logger.error(f"get_latest_price => {symbol}: {e}", exc_info=True)
             return None
 
+    # New: Retrieve options contracts given query parameters.
     def get_options_contracts(self, underlying: str, expiration_date_gte: str, expiration_date_lte: str) -> List[Dict]:
         options_rest = REST(
             key_id=config["API_KEY"],
@@ -637,43 +638,46 @@ def next_friday_expiration() -> datetime:
     next_friday = today + timedelta(days=days_ahead)
     return next_friday.replace(hour=16, minute=0, second=0, microsecond=0)
 
-def scan_best_option_contract(trader: AlpacaTrader, underlying: str, side: str) -> Optional[str]:
+def build_option_symbol(underlying: str, underlying_price: float, is_call: bool) -> str:
+    expiration = next_friday_expiration()
+    strike = int(round(underlying_price, 2) * 1000)
+    option_type = 'C' if is_call else 'P'
+    return f"{underlying}{expiration.strftime('%y%m%d')}{option_type}{strike:08d}"
+
+# UPDATED process_options: now selects the contract whose strike is closest to the underlying price.
+async def process_options(underlying: str, trader: AlpacaTrader, logger: logging.Logger, side: str):
+    underlying_price = await trader.get_latest_price(underlying)
+    if underlying_price is None:
+        logger.error(f"Could not retrieve latest price for {underlying}.")
+        return
     tomorrow = (datetime.now(timezone.utc) + timedelta(days=1)).strftime("%Y-%m-%d")
     next_week = (datetime.now(timezone.utc) + timedelta(days=7)).strftime("%Y-%m-%d")
-    contracts = trader.get_options_contracts(underlying, tomorrow, next_week)
-    if not contracts:
-        logger.error(f"No options contracts found for {underlying}")
-        return None
-    candidates = []
-    for contract in contracts:
-        try:
-            delta = float(contract.get("delta", 0))
-            gamma = float(contract.get("gamma", 0))
-            open_interest = int(contract.get("open_interest", 0))
-        except Exception:
-            continue
-        if side == "long" and not (0.4 <= delta <= 0.6):
-            continue
-        if side == "short" and not (-0.6 <= delta <= -0.4):
-            continue
-        score = gamma * open_interest
-        candidates.append((score, contract))
-    if not candidates:
-        logger.error(f"No suitable contract found for {underlying} ({side})")
-        return None
-    best = max(candidates, key=lambda x: x[0])[1]
-    symbol = best.get("symbol")
-    option_symbols_set.add(symbol)
-    logger.info(f"Scanned best option for {underlying} ({side}): {symbol} (delta={best.get('delta')}, gamma={best.get('gamma')}, OI={best.get('open_interest')})")
-    return symbol
-
-async def process_options(underlying: str, trader: AlpacaTrader, logger: logging.Logger, side: str):
-    option_symbol = scan_best_option_contract(trader, underlying, side)
-    if option_symbol is None:
+    options_chain = trader.get_options_contracts(underlying, tomorrow, next_week)
+    if not options_chain:
+        logger.error(f"No options contracts found for {underlying}.")
         return
-    logger.info(f"Placing options trade for {underlying}: {option_symbol}")
+    # Filter contracts by desired option type.
+    desired_type = "C" if side=="long" else "P"
+    filtered = [c for c in options_chain if c.get("option_type", "").upper() == desired_type]
+    if not filtered:
+        logger.error(f"No {side} options found for {underlying}.")
+        return
+    # Try to parse strike from each contract.
+    def parse_strike(contract):
+        if "strike_price" in contract:
+            return float(contract["strike_price"])
+        else:
+            try:
+                strike_str = contract.get("symbol")[-8:]
+                return int(strike_str) / 100.0
+            except Exception:
+                return float('inf')
+    best_contract = min(filtered, key=lambda c: abs(parse_strike(c) - underlying_price))
+    chosen_strike = parse_strike(best_contract)
+    generated_symbol = best_contract.get("symbol")
+    logger.info(f"Selected option for {underlying} ({side}): {generated_symbol} with strike {chosen_strike}")
     order = await trader.submit_order(
-        symbol=option_symbol,
+        symbol=generated_symbol,
         qty=1,
         side="buy",
         type="market",
@@ -681,7 +685,8 @@ async def process_options(underlying: str, trader: AlpacaTrader, logger: logging
         asset_class="option"
     )
     if order:
-        logger.info(f"Executed options order for {option_symbol}")
+        logger.info(f"Executed options order for {generated_symbol}")
+        rl_instance.save_agent()  # Save state after trade
 
 ###############################################################################
 # 9) Options Trading Engine: Process Underlying & Execute Option Trade
@@ -733,7 +738,7 @@ def compute_enhanced_indicators(df: pd.DataFrame) -> pd.DataFrame:
             df[col] = (df[col] - cmin) / (cmax - cmin)
     return df
 
-# Modified process_symbol: now accepts an RLTrader instance (rl_trader) instead of the inner agent
+# Modified process_symbol: uses the RLTrader instance to decide on an action.
 async def process_symbol(symbol: str, rl_trader, trader: AlpacaTrader, logger: logging.Logger, underlyings: List[str]):
     df = compute_enhanced_indicators(pd.DataFrame(live_bars[symbol]))
     if df.empty:
@@ -745,7 +750,6 @@ async def process_symbol(symbol: str, rl_trader, trader: AlpacaTrader, logger: l
         cluster_id = underlyings.index(symbol)
     except Exception:
         cluster_id = 0
-    # Use the RLTrader's pick_action method
     rl_action = rl_trader.pick_action(state, hist_tensor, cluster_id)
     if rl_action == 0:
         logger.info(f"{symbol} => RL Trader: Hold. No trade executed.")
@@ -834,9 +838,12 @@ def get_reward(symbol: str, current_price: float, trade_state: TradeState) -> fl
     return 0.0
 
 ###############################################################################
-# 11) Live Bars Storage and Websocket Callback
+# 11) Live Bars Storage and WebSocket Callback
 ###############################################################################
 async def on_bar_callback(bar):
+    if not is_market_hours():
+        logger.info("Market is closed. Skipping bar processing.")
+        return
     timestamp = getattr(bar, "timestamp", bar._raw.get("timestamp"))
     open_price = getattr(bar, "open", bar._raw.get("open"))
     high_price = getattr(bar, "high", bar._raw.get("high"))
@@ -858,7 +865,6 @@ async def on_bar_callback(bar):
     if len(live_bars[symbol]) > 50:
         live_bars[symbol] = live_bars[symbol][-50:]
     if len(live_bars[symbol]) >= 10:
-        # Modified: pass the RLTrader instance (rl_instance) rather than its inner agent.
         asyncio.create_task(process_symbol(symbol, rl_instance, trader_instance, logger, dynamic_underlyings))
 
 ###############################################################################
@@ -990,23 +996,42 @@ trade_state_instance: Optional[TradeState] = None
 async def main():
     global trader_instance, rl_instance, trade_state_instance, global_symbols, dynamic_underlyings
     trader_instance = AlpacaTrader(config, logger)
-    # For options trading, select top underlyings from a sample list.
+    # Wait for market to open if needed.
+    if not is_market_hours():
+        seconds_to_wait = time_until_market_open()
+        logger.info(f"Market is closed. Waiting for {seconds_to_wait:.0f} seconds until market open.")
+        await asyncio.sleep(seconds_to_wait)
+    # For options trading, select top underlyings via options screening.
     dynamic_underlyings = get_top_underlyings(trader_instance, config.get("sample_underlyings", ["AAPL", "MSFT", "GOOGL", "AMZN", "TSLA", "SPY"]), limit=3)
     if not dynamic_underlyings:
         logger.error("No suitable underlyings found via options screening. Exiting.")
         return
     logger.info(f"Dynamic underlyings for options trading: {dynamic_underlyings}")
-    # Also, get all tradable symbols for live equity bar subscription.
+    # NEW: Process all tradable stocks; compute combined weight (win ratio + normalized volume) and select top 150.
     all_symbols = get_all_tradable_symbols(trader_instance, logger)
-    global_symbols = []
+    candidate_symbols = []
+    metrics = {}
     for sym in all_symbols:
         df_hist = await fetch_initial_bars(sym, trader_instance, logger, days=90, timeframe="15Min")
-        if not df_hist.empty and len(df_hist) >= 10:
-            live_bars[sym] = df_hist.to_dict(orient="records")
-            global_symbols.append(sym)
-        else:
+        if df_hist.empty or len(df_hist) < 10:
             logger.warning(f"{sym} => Skipped due to insufficient historical bars.")
-    logger.info(f"Filtered symbols count: {len(global_symbols)}")
+            continue
+        live_bars[sym] = df_hist.to_dict(orient="records")
+        df_hist['return'] = df_hist['close'].pct_change()
+        win_ratio = (df_hist['return'] > 0).mean()
+        avg_vol = df_hist['volume'].mean()
+        metrics[sym] = (win_ratio, avg_vol)
+        candidate_symbols.append(sym)
+    volumes = [metrics[sym][1] for sym in candidate_symbols]
+    min_vol, max_vol = min(volumes), max(volumes)
+    combined_scores = {}
+    for sym in candidate_symbols:
+        win_ratio, avg_vol = metrics[sym]
+        norm_vol = (avg_vol - min_vol) / (max_vol - min_vol) if max_vol > min_vol else 0
+        combined_scores[sym] = win_ratio + norm_vol
+    top_150 = sorted(candidate_symbols, key=lambda x: combined_scores[x], reverse=True)[:150]
+    global_symbols = top_150
+    logger.info(f"Selected top {len(global_symbols)} symbols for trading based on win ratio and moving volume.")
     rl_instance = RLTrader(device, logger)
     trade_state_instance = TradeState()
     stream = Stream(API_KEY, API_SECRET, base_url=BASE_URL, data_feed="iex")
@@ -1028,4 +1053,3 @@ if __name__ == "__main__":
         logger.critical(f"Unhandled exception: {e}", exc_info=True)
         if rl_instance:
             rl_instance.save_agent()
-
