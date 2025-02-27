@@ -1,0 +1,7 @@
+alpaca-trade-api
+torch
+numpy
+pandas
+ta
+nest_asyncio
+transformers
